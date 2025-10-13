@@ -19,7 +19,7 @@ Touchscreen-friendly Raspberry Pi app that schedules Logitech webcam recordings,
 1. Install system packages:
    ```bash
    sudo apt update
-   sudo apt install python3 python3-venv python3-pip ffmpeg v4l-utils
+   sudo apt install python3 python3-venv python3-pip python3-tk ffmpeg v4l-utils
    ```
 2. (Recommended) Create and activate a virtual environment:
    ```bash
@@ -63,8 +63,10 @@ The loader ensures the output directory exists before recording.
 ## Running the App
 From the project root (with your virtual environment active if you made one):
 ```bash
-python -m dolly_cam.app --config config.toml
+python3 main.py --config config.toml
 ```
+
+You can still launch via `python -m dolly_cam.app` if you prefer the module entry point.
 
 The Tkinter window will fill the touchscreen (set `full_screen = false` to keep it windowed). Tap **Start Recording** to activate the scheduler: a five minute clip is recorded immediately and then every fifteen minutes. Tap **Stop Recording** to pause the schedule. Status text shows the next clip window, last clip filename, and any recent error.
 
