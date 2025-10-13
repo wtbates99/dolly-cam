@@ -82,49 +82,53 @@ def _load_table(data: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def _make_recording_config(raw: dict[str, Any]) -> RecordingConfig:
-    output_dir = _as_path(raw.get("output_dir")) if raw.get("output_dir") else Path.cwd() / "videos"
+    defaults = RecordingConfig()
+    output_dir = _as_path(raw.get("output_dir")) if raw.get("output_dir") else defaults.output_dir
     cfg = RecordingConfig(
-        camera_device=raw.get("camera_device", RecordingConfig.camera_device),
-        ffmpeg_path=raw.get("ffmpeg_path", RecordingConfig.ffmpeg_path),
-        duration_seconds=int(raw.get("duration_seconds", RecordingConfig.duration_seconds)),
-        interval_minutes=int(raw.get("interval_minutes", RecordingConfig.interval_minutes)),
+        camera_device=raw.get("camera_device", defaults.camera_device),
+        ffmpeg_path=raw.get("ffmpeg_path", defaults.ffmpeg_path),
+        duration_seconds=int(raw.get("duration_seconds", defaults.duration_seconds)),
+        interval_minutes=int(raw.get("interval_minutes", defaults.interval_minutes)),
         width=int(raw["width"]) if raw.get("width") else None,
         height=int(raw["height"]) if raw.get("height") else None,
         frame_rate=int(raw["frame_rate"]) if raw.get("frame_rate") else None,
         output_dir=output_dir,
-        filename_prefix=str(raw.get("filename_prefix", RecordingConfig.filename_prefix)),
+        filename_prefix=str(raw.get("filename_prefix", defaults.filename_prefix)),
     )
     return cfg
 
 
 def _make_drive_config(raw: dict[str, Any]) -> GoogleDriveConfig:
+    defaults = GoogleDriveConfig()
     cfg = GoogleDriveConfig(
-        enabled=bool(raw.get("enabled", GoogleDriveConfig.enabled)),
+        enabled=bool(raw.get("enabled", defaults.enabled)),
         credentials_file=_as_path(raw.get("credentials_file")),
         folder_id=raw.get("folder_id"),
-        chunk_size_mb=int(raw.get("chunk_size_mb", GoogleDriveConfig.chunk_size_mb)),
+        chunk_size_mb=int(raw.get("chunk_size_mb", defaults.chunk_size_mb)),
     )
     cfg.validate()
     return cfg
 
 
 def _make_retention_config(raw: dict[str, Any]) -> RetentionConfig:
-    return RetentionConfig(days=int(raw.get("days", RetentionConfig.days)))
+    defaults = RetentionConfig()
+    return RetentionConfig(days=int(raw.get("days", defaults.days)))
 
 
 def _make_touchscreen_config(raw: dict[str, Any]) -> TouchscreenConfig:
+    defaults = TouchscreenConfig()
     return TouchscreenConfig(
-        window_title=raw.get("window_title", TouchscreenConfig.window_title),
-        full_screen=bool(raw.get("full_screen", TouchscreenConfig.full_screen)),
-        button_font_size=int(raw.get("button_font_size", TouchscreenConfig.button_font_size)),
-        status_font_size=int(raw.get("status_font_size", TouchscreenConfig.status_font_size)),
-        poll_interval_ms=int(raw.get("poll_interval_ms", TouchscreenConfig.poll_interval_ms)),
-        width=int(raw.get("width", TouchscreenConfig.width)),
-        height=int(raw.get("height", TouchscreenConfig.height)),
-        background_color=str(raw.get("background_color", TouchscreenConfig.background_color)),
-        accent_color=str(raw.get("accent_color", TouchscreenConfig.accent_color)),
-        accent_text_color=str(raw.get("accent_text_color", TouchscreenConfig.accent_text_color)),
-        secondary_color=str(raw.get("secondary_color", TouchscreenConfig.secondary_color)),
+        window_title=raw.get("window_title", defaults.window_title),
+        full_screen=bool(raw.get("full_screen", defaults.full_screen)),
+        button_font_size=int(raw.get("button_font_size", defaults.button_font_size)),
+        status_font_size=int(raw.get("status_font_size", defaults.status_font_size)),
+        poll_interval_ms=int(raw.get("poll_interval_ms", defaults.poll_interval_ms)),
+        width=int(raw.get("width", defaults.width)),
+        height=int(raw.get("height", defaults.height)),
+        background_color=str(raw.get("background_color", defaults.background_color)),
+        accent_color=str(raw.get("accent_color", defaults.accent_color)),
+        accent_text_color=str(raw.get("accent_text_color", defaults.accent_text_color)),
+        secondary_color=str(raw.get("secondary_color", defaults.secondary_color)),
     )
 
 
