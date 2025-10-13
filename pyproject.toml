@@ -8,6 +8,8 @@ dependencies = [
     "google-api-python-client",
     "google-auth",
     "google-auth-httplib2",
+    "opencv-python",
+    "Pillow",
     "tomli; python_version<'3.11'",
 ]
 

@@ -55,6 +55,12 @@ class TouchscreenConfig:
     button_font_size: int = 28
     status_font_size: int = 18
     poll_interval_ms: int = 1000
+    width: int = 800
+    height: int = 480
+    background_color: str = "#f3edff"
+    accent_color: str = "#9a7bdc"
+    accent_text_color: str = "#ffffff"
+    secondary_color: str = "#d8c9ff"
 
 
 @dataclass(slots=True)
@@ -113,6 +119,12 @@ def _make_touchscreen_config(raw: dict[str, Any]) -> TouchscreenConfig:
         button_font_size=int(raw.get("button_font_size", TouchscreenConfig.button_font_size)),
         status_font_size=int(raw.get("status_font_size", TouchscreenConfig.status_font_size)),
         poll_interval_ms=int(raw.get("poll_interval_ms", TouchscreenConfig.poll_interval_ms)),
+        width=int(raw.get("width", TouchscreenConfig.width)),
+        height=int(raw.get("height", TouchscreenConfig.height)),
+        background_color=str(raw.get("background_color", TouchscreenConfig.background_color)),
+        accent_color=str(raw.get("accent_color", TouchscreenConfig.accent_color)),
+        accent_text_color=str(raw.get("accent_text_color", TouchscreenConfig.accent_text_color)),
+        secondary_color=str(raw.get("secondary_color", TouchscreenConfig.secondary_color)),
     )
 
 

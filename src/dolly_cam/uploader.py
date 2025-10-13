@@ -27,9 +27,15 @@ class UploadJob:
 class DriveUploader:
     """Background worker that uploads clips to Google Drive and prunes old ones."""
 
-    def __init__(self, drive_cfg: GoogleDriveConfig, retention_cfg: RetentionConfig) -> None:
+    def __init__(
+        self,
+        drive_cfg: GoogleDriveConfig,
+        retention_cfg: RetentionConfig,
+        local_directory: Path,
+    ) -> None:
         self._cfg = drive_cfg
         self._retention = retention_cfg
+        self._local_directory = local_directory
         self._queue: Queue[UploadJob | None] = Queue()
         self._worker: Optional[threading.Thread] = None
         self._stop_requested = threading.Event()
@@ -149,8 +155,12 @@ class DriveUploader:
                 for item in response.get("files", []):
                     created = _parse_timestamp(item.get("createdTime"))
                     if created and created < cutoff:
-                        LOGGER.info("Removing old Drive file %s (%s)", item.get("name"), item.get("id"))
-                        self._service.files().delete(fileId=item.get("id")).execute()
+                        name = item.get("name")
+                        file_id = item.get("id")
+                        LOGGER.info("Removing old Drive file %s (%s)", name, file_id)
+                        self._service.files().delete(fileId=file_id).execute()
+                        if name:
+                            self._delete_local_copy(name)
                         removed += 1
                 page_token = response.get("nextPageToken")
                 if not page_token:
@@ -159,6 +169,17 @@ class DriveUploader:
             LOGGER.warning("Drive cleanup failed: %s", exc)
         if removed:
             LOGGER.info("Drive cleanup removed %s file(s)", removed)
+
+    def _delete_local_copy(self, filename: str) -> None:
+        local_path = self._local_directory / filename
+        if not local_path.exists():
+            LOGGER.debug("Local clip already removed: %s", local_path)
+            return
+        try:
+            local_path.unlink(missing_ok=True)
+            LOGGER.info("Removed local clip after Drive cleanup: %s", filename)
+        except OSError as exc:
+            LOGGER.warning("Failed to remove local clip %s: %s", filename, exc)
 
 
 def _parse_timestamp(value: Optional[str]) -> Optional[datetime]:

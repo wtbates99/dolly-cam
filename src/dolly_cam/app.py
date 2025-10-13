@@ -39,7 +39,7 @@ def configure_logging(level: str) -> None:
 
 
 def build_app(config: AppConfig) -> tuple[DollyCamApp, RecordingController]:
-    uploader = DriveUploader(config.drive, config.retention)
+    uploader = DriveUploader(config.drive, config.retention, config.recording.output_dir)
     controller = RecordingController(config.recording, config.retention, uploader)
     app = DollyCamApp(controller, config.touchscreen)
     return app, controller
