@@ -1,0 +1,38 @@
+[recording]
+# Video device exposed by the Logitech webcam. Run `v4l2-ctl --list-devices` if uncertain.
+camera_device = "/dev/video0"
+# `ffmpeg` executable path. Adjust if ffmpeg is installed elsewhere.
+ffmpeg_path = "/usr/bin/ffmpeg"
+# 5-minute clips captured every 15 minutes.
+duration_seconds = 300
+interval_minutes = 15
+# Uncomment or adjust if you want to force a specific capture size or frame rate.
+width = 1280
+height = 720
+frame_rate = 30
+# Where clips are written on the Raspberry Pi.
+output_dir = "/home/pi/dolly_cam/videos"
+# File names will look like `dolly_YYYYmmdd_HHMMSS.mp4`.
+filename_prefix = "dolly"
+
+[google_drive]
+# Disable if you want to run locally without uploads.
+enabled = true
+# Service-account JSON generated in the Google Cloud Console.
+credentials_file = "/home/pi/dolly_cam/service-account.json"
+# Target folder ID in Google Drive where clips should be uploaded.
+folder_id = "REPLACE_WITH_FOLDER_ID"
+# Chunk size (in MB) for resumable uploads. Larger chunks use more memory.
+chunk_size_mb = 8
+
+[retention]
+# Automatically delete clips older than 3 days (both locally and in Drive).
+days = 3
+
+[touchscreen]
+window_title = "Dolly Cam"
+full_screen = true
+button_font_size = 32
+status_font_size = 20
+# UI refresh cadence in milliseconds.
+poll_interval_ms = 1500
