@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 try:  # Python 3.11+
     import tomllib  # type: ignore[attr-defined]
@@ -12,6 +14,7 @@ except ModuleNotFoundError:  # pragma: no cover - fallback for Python 3.10
     import tomli as tomllib  # type: ignore[no-redef]
 
 LOGGER = logging.getLogger(__name__)
+_DRIVE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{10,}$")
 
 
 @dataclass(slots=True)
@@ -103,7 +106,7 @@ def _make_drive_config(raw: dict[str, Any]) -> GoogleDriveConfig:
     cfg = GoogleDriveConfig(
         enabled=bool(raw.get("enabled", defaults.enabled)),
         credentials_file=_as_path(raw.get("credentials_file")),
-        folder_id=raw.get("folder_id"),
+        folder_id=_normalize_drive_folder_id(raw.get("folder_id")),
         chunk_size_mb=int(raw.get("chunk_size_mb", defaults.chunk_size_mb)),
     )
     cfg.validate()
@@ -161,3 +164,59 @@ def load_config(path: Path) -> AppConfig:
 def asdict(config: AppConfig) -> dict[str, Any]:
     """Expose the configuration as primitives for logging/debugging."""
     return dataclasses.asdict(config)
+
+
+def _normalize_drive_folder_id(raw: str | None) -> str | None:
+    """Accept either a bare folder ID or a shared URL, returning the sanitized ID."""
+    if raw is None:
+        return None
+
+    value = raw.strip()
+    if not value:
+        return None
+
+    candidates: list[str] = []
+
+    if "://" in value:
+        parsed = urlparse(value)
+        query_id = parse_qs(parsed.query).get("id")
+        if query_id:
+            candidates.extend(query_id)
+        path_segments = [segment for segment in parsed.path.split("/") if segment]
+        candidates.extend(path_segments)
+    else:
+        candidates.append(value)
+
+    expanded: list[str] = []
+    for candidate in candidates:
+        if "?" in candidate:
+            expanded.append(candidate.split("?", 1)[0])
+        if "#" in candidate:
+            expanded.append(candidate.split("#", 1)[0])
+        if "/" in candidate:
+            expanded.extend(segment for segment in candidate.split("/") if segment)
+        if "=" in candidate:
+            expanded.append(candidate.split("=", 1)[-1])
+
+    candidates.extend(expanded)
+
+    for candidate in candidates:
+        cleaned = candidate.strip().strip("/")
+        if not cleaned:
+            continue
+        if cleaned in {"drive", "folders", "file", "u", "open", "d"}:
+            continue
+        if _DRIVE_ID_PATTERN.fullmatch(cleaned):
+            if cleaned != value:
+                LOGGER.debug("Normalized Google Drive folder ID '%s' -> '%s'", value, cleaned)
+            return cleaned
+
+    fallback = value
+    if "?" in fallback:
+        fallback = fallback.split("?", 1)[0]
+    if "#" in fallback:
+        fallback = fallback.split("#", 1)[0]
+    fallback = fallback.strip().strip("/")
+    if fallback != value:
+        LOGGER.debug("Normalized Google Drive folder ID '%s' -> '%s'", value, fallback)
+    return fallback or None

@@ -1,5 +1,7 @@
 # Byte-compiled / optimized / DLL files
 uv.lock
+videos/
+*.mp4
 __pycache__/
 *.py[codz]
 *$py.class
