@@ -7,9 +7,12 @@ import numpy as np
 import threading
 import time
 import json
+import importlib.util
+import wave
+import subprocess
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 import logging
 
 try:
@@ -20,11 +23,8 @@ except (ImportError, OSError) as e:
     SOUNDDEVICE_AVAILABLE = False
     if isinstance(e, OSError) and 'PortAudio' in str(e):
         logging.warning("PortAudio library not found. Install with: sudo apt-get install portaudio19-dev")
-    try:
-        import pyaudio
-        PYAUDIO_AVAILABLE = True
-    except (ImportError, OSError):
-        PYAUDIO_AVAILABLE = False
+    PYAUDIO_AVAILABLE = importlib.util.find_spec("pyaudio") is not None
+    if not PYAUDIO_AVAILABLE:
         logging.warning("No audio library available - audio recording will be disabled")
 
 from storage_manager import StorageManager
@@ -43,6 +43,7 @@ class DogTracker:
     def __init__(self, storage_path: str = "./recordings", 
                  video_device: int = 0,
                  audio_device: Optional[int] = None,
+                 audio_channels: int = 1,
                  segment_duration: int = 60,
                  fps: int = 30,
                  resolution: tuple = (1280, 720),
@@ -66,8 +67,10 @@ class DogTracker:
         self.highlights_path = self.storage_path / "highlights"
         self.highlights_path.mkdir(parents=True, exist_ok=True)
         self.highlight_index_path = self.highlights_path / "index.jsonl"
+        self.segment_index_path = self.storage_path / "segments.jsonl"
         self.video_device = video_device
         self.audio_device = audio_device
+        self.requested_audio_channels = max(1, int(audio_channels))
         self.segment_duration = segment_duration
         self.fps = fps
         self.resolution = resolution
@@ -85,11 +88,12 @@ class DogTracker:
         self.video_writer = None
         self.audio_frames = []
         self.audio_sample_rate = 44100
-        self.audio_channels = 1
+        self.audio_channels = self.requested_audio_channels
         self.current_segment_path: Optional[Path] = None
         self.current_segment_frame_count = 0
         self.current_segment_motion_scores: List[float] = []
         self.current_segment_audio_peak_rms = 0.0
+        self.current_segment_audio_rms_samples: List[float] = []
         self.previous_gray_frame: Optional[np.ndarray] = None
         self.frame_index = 0
         
@@ -100,6 +104,27 @@ class DogTracker:
         
         # Check storage before starting
         self.storage_manager.check_and_cleanup()
+
+    def _reset_segment_trackers(self) -> None:
+        """Reset all per-segment accumulators."""
+        self.current_segment_frame_count = 0
+        self.current_segment_motion_scores = []
+        self.current_segment_audio_peak_rms = 0.0
+        self.current_segment_audio_rms_samples = []
+        with self.recording_lock:
+            self.audio_frames = []
+
+    def _ingest_audio_chunk(self, audio_chunk: np.ndarray) -> None:
+        """Store chunk and update audio analytics."""
+        if audio_chunk.size == 0:
+            return
+
+        chunk_rms = float(np.sqrt(np.mean(np.square(audio_chunk))))
+        with self.recording_lock:
+            self.audio_frames.append(audio_chunk.copy())
+            self.current_segment_audio_peak_rms = max(self.current_segment_audio_peak_rms, chunk_rms)
+            # Keep lightweight signal profile for noise/ambient analysis.
+            self.current_segment_audio_rms_samples.append(chunk_rms)
     
     def setup_audio(self):
         """Setup audio recording parameters."""
@@ -114,20 +139,35 @@ class DogTracker:
             
             device_info = sd.query_devices(self.audio_device)
             self.audio_sample_rate = int(device_info['default_samplerate'])
-            self.audio_channels = device_info['max_input_channels']
+            max_input = int(device_info['max_input_channels'])
+            self.audio_channels = max(1, min(self.requested_audio_channels, max_input, 2))
             logger.info(f"Using audio device {self.audio_device}: {device_info['name']}")
-            logger.info(f"Sample rate: {self.audio_sample_rate} Hz, Channels: {self.audio_channels}")
+            logger.info(
+                "Sample rate: %s Hz, Channels: %s (requested=%s, device_max=%s)",
+                self.audio_sample_rate,
+                self.audio_channels,
+                self.requested_audio_channels,
+                max_input,
+            )
         
         elif PYAUDIO_AVAILABLE:
+            pyaudio = importlib.import_module("pyaudio")
             p = pyaudio.PyAudio()
             if self.audio_device is None:
                 self.audio_device = p.get_default_input_device_info()['index']
             
             device_info = p.get_device_info_by_index(self.audio_device)
             self.audio_sample_rate = int(device_info['defaultSampleRate'])
-            self.audio_channels = device_info['maxInputChannels']
+            max_input = int(device_info['maxInputChannels'])
+            self.audio_channels = max(1, min(self.requested_audio_channels, max_input, 2))
             logger.info(f"Using audio device {self.audio_device}: {device_info['name']}")
-            logger.info(f"Sample rate: {self.audio_sample_rate} Hz, Channels: {self.audio_channels}")
+            logger.info(
+                "Sample rate: %s Hz, Channels: %s (requested=%s, device_max=%s)",
+                self.audio_sample_rate,
+                self.audio_channels,
+                self.requested_audio_channels,
+                max_input,
+            )
             p.terminate()
         else:
             logger.warning("No audio library available - audio recording disabled")
@@ -145,17 +185,14 @@ class DogTracker:
                     audio_chunk, overflowed = stream.read(int(self.audio_sample_rate * 0.1))
                     if overflowed:
                         logger.warning("Audio buffer overflow")
-                    chunk_rms = float(np.sqrt(np.mean(np.square(audio_chunk)))) if audio_chunk.size else 0.0
-                    with self.recording_lock:
-                        self.audio_frames.append(audio_chunk.copy())
-                        self.current_segment_audio_peak_rms = max(self.current_segment_audio_peak_rms, chunk_rms)
+                    self._ingest_audio_chunk(audio_chunk)
         except Exception as e:
             logger.error(f"Error in audio recording: {e}")
     
     def record_audio_pyaudio(self):
         """Record audio using pyaudio library."""
         try:
-            import pyaudio
+            pyaudio = importlib.import_module("pyaudio")
             p = pyaudio.PyAudio()
             stream = p.open(format=pyaudio.paFloat32,
                           channels=self.audio_channels,
@@ -166,13 +203,10 @@ class DogTracker:
             
             logger.info("Audio recording started (pyaudio)")
             while self.is_recording:
-                audio_chunk = stream.read(int(self.audio_sample_rate * 0.1))
+                audio_chunk = stream.read(int(self.audio_sample_rate * 0.1), exception_on_overflow=False)
                 audio_array = np.frombuffer(audio_chunk, dtype=np.float32)
                 audio_array = audio_array.reshape(-1, self.audio_channels)
-                chunk_rms = float(np.sqrt(np.mean(np.square(audio_array)))) if audio_array.size else 0.0
-                with self.recording_lock:
-                    self.audio_frames.append(audio_array.copy())
-                    self.current_segment_audio_peak_rms = max(self.current_segment_audio_peak_rms, chunk_rms)
+                self._ingest_audio_chunk(audio_array)
             
             stream.stop_stream()
             stream.close()
@@ -198,6 +232,31 @@ class DogTracker:
         total_pixels = float(thresh.size) if thresh.size else 1.0
         motion_score = motion_pixels / total_pixels
         return motion_score
+
+    def classify_noise_profile(self) -> Tuple[float, float, float, str]:
+        """
+        Return (ambient_rms, peak_rms, spike_ratio, noise_level).
+
+        noise_level is a human-friendly summary for quick timeline reviews.
+        """
+        if not self.current_segment_audio_rms_samples:
+            return 0.0, 0.0, 0.0, "unknown"
+
+        arr = np.array(self.current_segment_audio_rms_samples, dtype=np.float32)
+        ambient_rms = float(np.percentile(arr, 25))
+        peak_rms = float(np.max(arr))
+        spike_ratio = float(peak_rms / max(ambient_rms, 1e-6))
+
+        if ambient_rms < 0.01 and peak_rms < 0.02:
+            noise_level = "quiet"
+        elif spike_ratio >= 4.0:
+            noise_level = "bursty"
+        elif ambient_rms >= 0.04:
+            noise_level = "loud"
+        else:
+            noise_level = "normal"
+
+        return ambient_rms, peak_rms, spike_ratio, noise_level
     
     def record_video(self):
         """Record video frames."""
@@ -281,13 +340,7 @@ class DogTracker:
         
         logger.info(f"Started new segment: {filename}")
         self.current_segment_path = video_path
-        self.current_segment_frame_count = 0
-        self.current_segment_motion_scores = []
-        self.current_segment_audio_peak_rms = 0.0
-        
-        # Clear audio frames for new segment
-        with self.recording_lock:
-            self.audio_frames = []
+        self._reset_segment_trackers()
     
     def finish_segment(self):
         """Finish current segment and save metadata."""
@@ -308,8 +361,11 @@ class DogTracker:
                 audio_data = np.concatenate(self.audio_frames, axis=0)
                 self.audio_frames = []
 
+        video_path = self.embed_audio_into_video(video_path, audio_data)
+
         motion_avg = float(np.mean(self.current_segment_motion_scores)) if self.current_segment_motion_scores else 0.0
         motion_peak = float(np.max(self.current_segment_motion_scores)) if self.current_segment_motion_scores else 0.0
+        ambient_rms, peak_rms, spike_ratio, noise_level = self.classify_noise_profile()
 
         # Extract metadata + highlight decision
         self.extract_and_save_metadata(
@@ -319,10 +375,87 @@ class DogTracker:
             motion_avg=motion_avg,
             motion_peak=motion_peak,
             audio_peak_rms=self.current_segment_audio_peak_rms,
+            ambient_rms=ambient_rms,
+            peak_rms=peak_rms,
+            spike_ratio=spike_ratio,
+            noise_level=noise_level,
         )
         
         # Check storage and cleanup if needed
         self.storage_manager.check_and_cleanup()
+
+    def write_audio_wav(self, video_path: Path, audio_data: np.ndarray) -> Optional[Path]:
+        """Write segment audio as a WAV sidecar file for ML and muxing."""
+        if audio_data is None or len(audio_data) == 0:
+            return None
+
+        audio_path = video_path.with_suffix(".wav")
+        channels = 1 if audio_data.ndim == 1 else int(audio_data.shape[1])
+        if channels > 2:
+            # Keep muxing/browser compatibility by downmixing excessive channels.
+            audio_data = np.mean(audio_data, axis=1)
+            channels = 1
+
+        pcm = np.clip(audio_data, -1.0, 1.0)
+        pcm = (pcm * 32767.0).astype(np.int16)
+
+        with wave.open(str(audio_path), "wb") as wav_file:
+            wav_file.setnchannels(channels)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(self.audio_sample_rate)
+            wav_file.writeframes(pcm.tobytes())
+
+        return audio_path
+
+    def embed_audio_into_video(self, video_path: Path, audio_data: Optional[np.ndarray]) -> Path:
+        """Mux recorded WAV audio into the segment MP4 in place."""
+        if audio_data is None or len(audio_data) == 0:
+            return video_path
+
+        audio_path = self.write_audio_wav(video_path, audio_data)
+        if audio_path is None:
+            return video_path
+
+        muxed_path = video_path.with_name(f"{video_path.stem}.mux.mp4")
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(video_path),
+            "-i",
+            str(audio_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(muxed_path),
+        ]
+
+        try:
+            subprocess.run(
+                ffmpeg_cmd,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            muxed_path.replace(video_path)
+            logger.info("Muxed audio into video: %s", video_path.name)
+        except Exception as e:
+            if muxed_path.exists():
+                muxed_path.unlink(missing_ok=True)
+            stderr_tail = ""
+            if hasattr(e, "stderr") and getattr(e, "stderr"):
+                stderr_text = str(getattr(e, "stderr"))
+                stderr_tail = stderr_text[-400:]
+            logger.warning("Failed to mux audio into %s: %s %s", video_path.name, e, stderr_tail)
+
+        return video_path
 
     def append_highlight_event(self, metadata: Dict) -> None:
         """Append highlight event metadata to a JSONL index for fast review."""
@@ -337,9 +470,30 @@ class DogTracker:
             'motion_avg': metadata.get('motion_avg', 0.0),
             'motion_peak': metadata.get('motion_peak', 0.0),
             'segment_audio_peak_rms': metadata.get('segment_audio_peak_rms', 0.0),
+            'ambient_audio_rms': metadata.get('ambient_audio_rms', 0.0),
+            'noise_spike_ratio': metadata.get('noise_spike_ratio', 0.0),
+            'noise_level': metadata.get('noise_level', 'unknown'),
             'duration_seconds': metadata.get('video_metadata', {}).get('duration_seconds', 0.0),
         }
-        with open(self.highlight_index_path, 'a') as f:
+        with open(self.highlight_index_path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(event) + "\n")
+
+    def append_segment_event(self, metadata: Dict) -> None:
+        """Append every segment event for complete day timeline analysis."""
+        event = {
+            'timestamp': metadata.get('timestamp'),
+            'video_file': metadata.get('video_file'),
+            'video_path': metadata.get('video_path'),
+            'is_highlight': metadata.get('is_highlight', False),
+            'highlight_score': metadata.get('highlight_score', 0.0),
+            'event_type': metadata.get('event_type', 'unknown'),
+            'noise_level': metadata.get('noise_level', 'unknown'),
+            'noise_spike_ratio': metadata.get('noise_spike_ratio', 0.0),
+            'motion_avg': metadata.get('motion_avg', 0.0),
+            'motion_peak': metadata.get('motion_peak', 0.0),
+            'duration_seconds': metadata.get('video_metadata', {}).get('duration_seconds', 0.0),
+        }
+        with open(self.segment_index_path, 'a', encoding='utf-8') as f:
             f.write(json.dumps(event) + "\n")
     
     def extract_and_save_metadata(
@@ -350,6 +504,10 @@ class DogTracker:
         motion_avg: float,
         motion_peak: float,
         audio_peak_rms: float,
+        ambient_rms: float,
+        peak_rms: float,
+        spike_ratio: float,
+        noise_level: str,
     ):
         """Extract and save metadata for a video segment."""
         try:
@@ -370,12 +528,7 @@ class DogTracker:
             # Extract audio features if available
             audio_features = None
             if audio_data is not None and len(audio_data) > 0:
-                # Convert to mono if stereo
-                if len(audio_data.shape) > 1:
-                    audio_mono = np.mean(audio_data, axis=1)
-                else:
-                    audio_mono = audio_data
-                
+                audio_mono = self.metadata_extractor._to_mono_float32(audio_data)
                 audio_features = self.metadata_extractor.extract_audio_features(
                     audio_mono, self.audio_sample_rate
                 )
@@ -402,6 +555,10 @@ class DogTracker:
                     'motion_avg': motion_avg,
                     'motion_peak': motion_peak,
                     'segment_audio_peak_rms': audio_peak_rms,
+                    'ambient_audio_rms': ambient_rms,
+                    'noise_peak_rms': peak_rms,
+                    'noise_spike_ratio': spike_ratio,
+                    'noise_level': noise_level,
                     'is_highlight': highlight['is_highlight'],
                     'highlight_score': highlight['score'],
                     'highlight_reasons': highlight['reasons'],
@@ -413,6 +570,7 @@ class DogTracker:
             # Save metadata
             metadata_path = video_path.with_suffix('.json')
             self.metadata_extractor.save_metadata(metadata, metadata_path)
+            self.append_segment_event(metadata)
 
             # Keep lightweight index of important moments for quick review.
             if highlight['is_highlight']:
@@ -482,6 +640,8 @@ def main():
                        help='Video device index (default: 0)')
     parser.add_argument('--audio-device', type=int, default=None,
                        help='Audio device index (default: auto-detect)')
+    parser.add_argument('--audio-channels', type=int, default=1,
+                       help='Audio channels to capture (1=mono, 2=stereo, default: 1)')
     parser.add_argument('--segment-duration', type=int, default=60,
                        help='Duration of each segment in seconds (default: 60)')
     parser.add_argument('--fps', type=int, default=30,
@@ -509,6 +669,7 @@ def main():
         storage_path=args.storage_path,
         video_device=args.video_device,
         audio_device=args.audio_device,
+        audio_channels=args.audio_channels,
         segment_duration=args.segment_duration,
         fps=args.fps,
         resolution=(width, height),

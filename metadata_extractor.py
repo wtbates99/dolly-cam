@@ -26,6 +26,18 @@ class MetadataExtractor:
     def __init__(self):
         """Initialize metadata extractor."""
         self.librosa_available = LIBROSA_AVAILABLE
+
+    @staticmethod
+    def _to_mono_float32(audio_data: np.ndarray) -> np.ndarray:
+        """Normalize input audio into mono float32 array."""
+        if len(audio_data.shape) > 1:
+            audio_mono = np.mean(audio_data, axis=1)
+        else:
+            audio_mono = audio_data
+
+        if audio_mono.dtype != np.float32:
+            audio_mono = audio_mono.astype(np.float32)
+        return audio_mono
     
     def extract_audio_features(self, audio_data: np.ndarray, sample_rate: int) -> Dict:
         """
@@ -64,15 +76,7 @@ class MetadataExtractor:
         # Advanced features with librosa if available
         if self.librosa_available:
             try:
-                # Convert to mono if stereo
-                if len(audio_data.shape) > 1:
-                    audio_mono = np.mean(audio_data, axis=1)
-                else:
-                    audio_mono = audio_data
-                
-                # Ensure float32 format
-                if audio_mono.dtype != np.float32:
-                    audio_mono = audio_mono.astype(np.float32)
+                audio_mono = self._to_mono_float32(audio_data)
                 
                 # Spectral features
                 spectral_centroids = librosa.feature.spectral_centroid(y=audio_mono, sr=sample_rate)[0]

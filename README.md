@@ -8,6 +8,7 @@ A Raspberry Pi application for tracking dogs using webcam video and audio record
 - **Audio Recording**: Simultaneous audio capture with the video
 - **Smart Storage Management**: Automatically deletes old footage when storage exceeds 90% capacity
 - **Highlight Capture**: Scores segments by motion + audio and writes a fast review index at `recordings/highlights/index.jsonl`
+- **Full Activity Timeline**: Logs every segment in `recordings/segments.jsonl` for complete "what happened at home?" playback
 - **Metadata Extraction**: Extracts comprehensive metadata including:
   - Video properties (resolution, FPS, duration, codec)
   - Audio features (MFCC, spectral centroid, chroma, tempo, RMS energy)
@@ -126,6 +127,10 @@ Storage information includes:
 ### Highlight Review Index
 - Location: `storage_path/highlights/index.jsonl`
 - One JSON event per line with score, reason, and clip path for fast "what happened?" review
+
+### Segment Timeline Index
+- Location: `storage_path/segments.jsonl`
+- One JSON event per segment including motion level, noise profile, event type, and highlight score
 
 ## Metadata for ML Models
 

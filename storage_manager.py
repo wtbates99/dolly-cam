@@ -2,10 +2,11 @@
 Storage management module for monitoring disk usage and cleaning up old footage.
 Ensures storage never exceeds 90% capacity.
 """
+import json
 import shutil
 from pathlib import Path
 from datetime import datetime
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -44,7 +45,6 @@ class StorageManager:
         """
         stat = shutil.disk_usage(self.storage_path)
         total_gb = stat.total / (1024 ** 3)
-        used_gb = stat.used / (1024 ** 3)
         free_gb = stat.free / (1024 ** 3)
         used_percent = (stat.used / stat.total) * 100
         
@@ -61,17 +61,9 @@ class StorageManager:
         Returns:
             List of Path objects sorted by modification time (oldest first)
         """
-        normal_files = self._collect_video_files(only_highlights=False)
-        normal_files.sort(key=lambda p: p.stat().st_mtime)
+        inventory = self._scan_video_inventory()
+        normal_files = [item["path"] for item in inventory if not item["is_highlight"]]
         return normal_files[:num_files]
-
-    def _collect_video_files(self, only_highlights: bool) -> List[Path]:
-        """Collect video files recursively filtered by highlight flag."""
-        video_files: List[Path] = []
-        for ext in self.VIDEO_EXTENSIONS:
-            video_files.extend(self.storage_path.rglob(f'*{ext}'))
-
-        return [p for p in video_files if self._is_highlight_file(p) == only_highlights]
 
     def _is_highlight_file(self, video_path: Path) -> bool:
         """Determine highlight status from sidecar metadata file."""
@@ -80,13 +72,38 @@ class StorageManager:
             return False
 
         try:
-            import json
-            with open(metadata_file, 'r') as f:
+            with open(metadata_file, 'r', encoding='utf-8') as f:
                 metadata = json.load(f)
             return bool(metadata.get('is_highlight', False))
         except Exception:
             # If metadata cannot be parsed, treat as normal footage.
             return False
+
+    def _scan_video_inventory(self) -> List[Dict]:
+        """
+        Scan videos once and return sorted inventory records.
+
+        Each record contains:
+        - path: Path
+        - size_gb: float
+        - mtime: float
+        - modified_iso: str
+        - is_highlight: bool
+        """
+        inventory: List[Dict] = []
+        for ext in self.VIDEO_EXTENSIONS:
+            for path in self.storage_path.rglob(f'*{ext}'):
+                stat = path.stat()
+                inventory.append({
+                    "path": path,
+                    "size_gb": stat.st_size / (1024 ** 3),
+                    "mtime": stat.st_mtime,
+                    "modified_iso": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                    "is_highlight": self._is_highlight_file(path),
+                })
+
+        inventory.sort(key=lambda item: item["mtime"])
+        return inventory
     
     def cleanup_old_footage(self, target_free_gb: float = None) -> int:
         """
@@ -115,24 +132,27 @@ class StorageManager:
         
         logger.info(f"Starting cleanup: {used_percent:.1f}% used, need {target_free_gb:.2f} GB free")
         
+        inventory = self._scan_video_inventory()
+        normal_items = [item for item in inventory if not item["is_highlight"]]
+        highlight_items = [item for item in inventory if item["is_highlight"]]
+        normal_idx = 0
+        highlight_idx = 0
+
         while current_free_gb < target_free_gb:
-            normal_files = self._collect_video_files(only_highlights=False)
-            normal_files.sort(key=lambda p: p.stat().st_mtime)
-
-            highlight_files = self._collect_video_files(only_highlights=True)
-            highlight_files.sort(key=lambda p: p.stat().st_mtime)
-
-            if normal_files:
-                file_to_delete = normal_files[0]
+            if normal_idx < len(normal_items):
+                item = normal_items[normal_idx]
+                normal_idx += 1
                 delete_reason = "normal footage"
-            elif len(highlight_files) > self.min_highlight_files_to_keep:
-                file_to_delete = highlight_files[0]
+            elif (len(highlight_items) - highlight_idx) > self.min_highlight_files_to_keep:
+                item = highlight_items[highlight_idx]
+                highlight_idx += 1
                 delete_reason = "highlight footage (fallback)"
             else:
                 logger.warning("No more files to delete")
                 break
 
-            file_size_gb = file_to_delete.stat().st_size / (1024 ** 3)
+            file_to_delete: Path = item["path"]
+            file_size_gb = item["size_gb"]
             
             try:
                 # Also delete associated metadata file if it exists
@@ -179,17 +199,14 @@ class StorageManager:
         stat = shutil.disk_usage(self.storage_path)
         used_percent, free_gb = self.get_disk_usage()
         
-        video_files = []
-        total_size_gb = 0
-        for file in self._collect_video_files(only_highlights=False) + self._collect_video_files(only_highlights=True):
-            size = file.stat().st_size / (1024 ** 3)
-            video_files.append({
-                'name': file.name,
-                'size_gb': size,
-                'modified': datetime.fromtimestamp(file.stat().st_mtime).isoformat(),
-                'is_highlight': self._is_highlight_file(file),
-            })
-            total_size_gb += size
+        inventory = self._scan_video_inventory()
+        video_files = [{
+            'name': item['path'].name,
+            'size_gb': item['size_gb'],
+            'modified': item['modified_iso'],
+            'is_highlight': item['is_highlight'],
+        } for item in inventory]
+        total_size_gb = sum(item['size_gb'] for item in inventory)
         
         return {
             'total_gb': stat.total / (1024 ** 3),
