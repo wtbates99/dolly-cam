@@ -1,9 +1,10 @@
-# Raspberry Pi Ring-Style Home Camera
+# Dolly Bates Memorial Camera
 
-This setup is optimized for Raspberry Pi 4 + USB webcam and gives you:
+This setup is optimized for Raspberry Pi 4 + USB webcam, dedicated to Dolly Bates, and gives you:
 
 - Motion-triggered MP4 clip recording
 - Live stream (`/stream.mjpg`) and live dashboard (`/`)
+- Playback of recent motion clips directly on the dashboard
 - Event scoring + highlight indexing (`segments.jsonl`, `highlights/index.jsonl`)
 - Offline analytics dashboard report (`reports/home_camera_report.html`)
 - Storage auto-cleanup when disk usage crosses a threshold
@@ -38,7 +39,8 @@ python3 ring_camera.py \
   --stream-fps 8 \
   --host 0.0.0.0 \
   --port 8080 \
-  --access-token YOUR_LONG_RANDOM_TOKEN
+  --access-token YOUR_LONG_RANDOM_TOKEN \
+  --admin-token YOUR_SEPARATE_ADMIN_TOKEN
 ```
 
 Open on LAN:
@@ -46,6 +48,54 @@ Open on LAN:
 - `http://<PI_LOCAL_IP>:8080/` (dashboard + live stream)
 - `http://<PI_LOCAL_IP>:8080/health`
 - `http://<PI_LOCAL_IP>:8080/stream.mjpg?token=YOUR_LONG_RANDOM_TOKEN`
+
+The dashboard now includes:
+
+- `Play` for recent clips
+- Type filter (`event_type` + parsed motion type)
+- Clip-name contains filter
+- Quick visible event counts by type
+
+API filters:
+
+```bash
+curl "http://<PI_LOCAL_IP>:8080/api/status?token=YOUR_LONG_RANDOM_TOKEN&type=steady_activity&clip_contains=181118"
+```
+
+Parse one clip and return usable features:
+
+```bash
+curl "http://<PI_LOCAL_IP>:8080/api/clip-features?token=YOUR_LONG_RANDOM_TOKEN&clip=motion_20260218_181118_059483.mp4"
+```
+
+## Turn remote viewing off/on
+
+You can disable remote viewing immediately without stopping recording.
+
+Check current state:
+
+```bash
+curl "http://<PI_LOCAL_IP>:8080/api/remote-view?token=YOUR_LONG_RANDOM_TOKEN"
+```
+
+Disable remote viewing (works from anywhere if you have admin token):
+
+```bash
+curl -X POST "http://<PI_LOCAL_IP>:8080/api/remote-view?action=disable&token=YOUR_LONG_RANDOM_TOKEN&admin_token=YOUR_SEPARATE_ADMIN_TOKEN"
+```
+
+Enable remote viewing again (local network only, for safety):
+
+```bash
+curl -X POST "http://<PI_LOCAL_IP>:8080/api/remote-view?action=enable&token=YOUR_LONG_RANDOM_TOKEN&admin_token=YOUR_SEPARATE_ADMIN_TOKEN"
+```
+
+Shortcut script:
+
+```bash
+./scripts/remote_view_control.sh disable http://<PI_LOCAL_IP>:8080 YOUR_LONG_RANDOM_TOKEN YOUR_SEPARATE_ADMIN_TOKEN
+./scripts/remote_view_control.sh status  http://<PI_LOCAL_IP>:8080 YOUR_LONG_RANDOM_TOKEN YOUR_SEPARATE_ADMIN_TOKEN
+```
 
 ## Tune motion detection
 
@@ -89,6 +139,7 @@ Set these values in the service file:
 - `WorkingDirectory`
 - `ExecStart` path
 - `--access-token`
+- `--admin-token`
 
 ## Synology router remote access
 
@@ -97,6 +148,7 @@ Set these values in the service file:
 3. Configure DDNS hostname in SRM.
 4. Prefer HTTPS reverse-proxy on Synology and restrict source access.
 5. Use a strong `--access-token`.
+6. Set `--trust-proxy-headers` only when traffic comes through your trusted reverse proxy.
 
 ## Files
 
@@ -104,3 +156,4 @@ Set these values in the service file:
 - `storage_manager.py`: cleanup policy
 - `visualize_tracker_data.py`: offline analytics + HTML report
 - `deploy/ring-camera.service`: service template
+- `scripts/remote_view_control.sh`: helper to enable/disable remote viewing

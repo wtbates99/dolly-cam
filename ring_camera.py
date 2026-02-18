@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Raspberry Pi home camera: motion clips, live stream, and lightweight dashboard APIs."""
+"""Dolly Bates memorial camera: motion clips, live stream, and lightweight dashboard APIs."""
 
 from __future__ import annotations
 
 import argparse
+import copy
+import ipaddress
 import json
 import logging
+import secrets
 import signal
+import subprocess
 import threading
 import time
 from collections import deque
@@ -17,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Deque, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import cv2
 import numpy as np
@@ -25,7 +29,7 @@ import numpy as np
 from storage_manager import StorageManager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("ring_camera")
+logger = logging.getLogger("dolly_bates_camera")
 
 
 @dataclass
@@ -62,6 +66,8 @@ class RingCamera:
         self.storage_path.mkdir(parents=True, exist_ok=True)
         self.highlights_dir = self.storage_path / "highlights"
         self.highlights_dir.mkdir(parents=True, exist_ok=True)
+        self.web_clips_dir = self.storage_path / "web_clips"
+        self.web_clips_dir.mkdir(parents=True, exist_ok=True)
         self.segment_index_path = self.storage_path / "segments.jsonl"
         self.highlight_index_path = self.highlights_dir / "index.jsonl"
 
@@ -100,6 +106,174 @@ class RingCamera:
 
         self.events_lock = threading.Lock()
         self.recent_events: Deque[Dict] = deque(maxlen=200)
+        self.web_clip_lock = threading.Lock()
+        self.clip_feature_cache: Dict[str, Dict] = {}
+        self.clip_feature_cache_lock = threading.Lock()
+
+        self._load_recent_events_from_index()
+
+    def _load_recent_events_from_index(self) -> None:
+        if not self.segment_index_path.exists():
+            return
+        loaded: List[Dict] = []
+        try:
+            with open(self.segment_index_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    raw = line.strip()
+                    if not raw:
+                        continue
+                    try:
+                        payload = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(payload, dict):
+                        loaded.append(payload)
+        except Exception:
+            logger.exception("Failed reading segment index: %s", self.segment_index_path)
+            return
+
+        loaded = loaded[-200:]
+        loaded.reverse()
+        with self.events_lock:
+            self.recent_events.clear()
+            for event in loaded:
+                self.recent_events.append(event)
+
+    def _event_clip_path(self, event: Dict) -> Optional[Path]:
+        video_file = str(event.get("video_file", "")).strip()
+        if video_file:
+            candidate = (self.storage_path / Path(video_file).name).resolve()
+            if candidate.exists():
+                return candidate
+
+        video_path = str(event.get("video_path", "")).strip()
+        if not video_path:
+            return None
+
+        candidate = Path(video_path).expanduser()
+        if not candidate.is_absolute():
+            candidate = (self.storage_path / candidate).resolve()
+        if candidate.exists():
+            return candidate
+        return None
+
+    def _parse_clip_features(self, clip_path: Path) -> Dict:
+        cap = cv2.VideoCapture(str(clip_path))
+        if not cap.isOpened():
+            return {"parsed_ok": False}
+
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if fps <= 0.1:
+            fps = self.capture_fps if self.capture_fps > 0.1 else float(self.requested_fps)
+
+        stride = 1
+        if total_frames > 0:
+            stride = max(1, total_frames // 160)
+
+        idx = 0
+        sampled_frames = 0
+        brightness_values: List[float] = []
+        delta_values: List[float] = []
+        prev_gray: Optional[np.ndarray] = None
+
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if idx % stride != 0:
+                idx += 1
+                continue
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            brightness = float(np.mean(gray))
+            brightness_values.append(brightness)
+            if prev_gray is not None:
+                diff = cv2.absdiff(prev_gray, gray)
+                delta_values.append(float(np.mean(diff)))
+            prev_gray = gray
+            sampled_frames += 1
+            idx += 1
+
+        cap.release()
+
+        if sampled_frames == 0:
+            return {"parsed_ok": False}
+
+        avg_brightness = float(np.mean(brightness_values))
+        brightness_std = float(np.std(brightness_values))
+        mean_delta = float(np.mean(delta_values)) if delta_values else 0.0
+        peak_delta = float(np.max(delta_values)) if delta_values else 0.0
+
+        if mean_delta >= 8.0 or peak_delta >= 20.0:
+            parsed_motion_type = "intense_activity"
+        elif mean_delta >= 3.0 or peak_delta >= 8.0:
+            parsed_motion_type = "steady_activity"
+        else:
+            parsed_motion_type = "subtle_activity"
+
+        if avg_brightness < 55.0:
+            lighting = "dark"
+        elif avg_brightness < 140.0:
+            lighting = "normal"
+        else:
+            lighting = "bright"
+
+        parsed_duration = float(total_frames / fps) if total_frames > 0 and fps > 0.1 else 0.0
+        return {
+            "parsed_ok": True,
+            "parsed_total_frames": total_frames,
+            "parsed_sampled_frames": sampled_frames,
+            "parsed_fps": float(fps),
+            "parsed_duration_seconds": parsed_duration,
+            "parsed_brightness_avg": avg_brightness,
+            "parsed_brightness_std": brightness_std,
+            "parsed_frame_delta_mean": mean_delta,
+            "parsed_frame_delta_peak": peak_delta,
+            "parsed_motion_type": parsed_motion_type,
+            "parsed_lighting": lighting,
+        }
+
+    def _get_clip_features(self, clip_path: Path) -> Dict:
+        try:
+            stat = clip_path.stat()
+        except FileNotFoundError:
+            return {"parsed_ok": False}
+        cache_key = f"{clip_path.resolve()}::{stat.st_mtime_ns}"
+        with self.clip_feature_cache_lock:
+            cached = self.clip_feature_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        parsed = self._parse_clip_features(clip_path)
+        with self.clip_feature_cache_lock:
+            # Keep cache bounded with simple FIFO behavior.
+            if len(self.clip_feature_cache) >= 256:
+                oldest_key = next(iter(self.clip_feature_cache))
+                self.clip_feature_cache.pop(oldest_key, None)
+            self.clip_feature_cache[cache_key] = parsed
+        return parsed
+
+    def _enrich_event(self, event: Dict) -> Dict:
+        enriched = copy.deepcopy(event)
+        clip_path = self._event_clip_path(enriched)
+        if clip_path is None:
+            enriched["parsed_ok"] = False
+            enriched["filter_types"] = [str(enriched.get("event_type", "unknown"))]
+            return enriched
+
+        parsed = self._get_clip_features(clip_path)
+        enriched.update(parsed)
+
+        types = {str(enriched.get("event_type", "unknown"))}
+        parsed_motion_type = str(enriched.get("parsed_motion_type", "")).strip()
+        if parsed_motion_type:
+            types.add(parsed_motion_type)
+        stop_reason = str(enriched.get("stop_reason", "")).strip()
+        if stop_reason:
+            types.add(stop_reason)
+        enriched["filter_types"] = sorted(types)
+        return enriched
 
     def _motion_metrics(self, frame: np.ndarray) -> Tuple[bool, float, float]:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -353,38 +527,162 @@ class RingCamera:
         with self.frame_lock:
             return self.latest_jpeg
 
-    def get_status(self) -> Dict:
+    def get_status(self, event_type_filter: str = "", clip_contains: str = "", limit: int = 20) -> Dict:
         with self.events_lock:
-            recent = list(self.recent_events)[:20]
+            recent = list(self.recent_events)
+
+        all_enriched = [self._enrich_event(event) for event in recent]
+        enriched_recent = all_enriched
+
+        raw_filter = event_type_filter.strip().lower()
+        if raw_filter and raw_filter != "all":
+            filtered: List[Dict] = []
+            for event in enriched_recent:
+                event_type = str(event.get("event_type", "")).lower()
+                parsed_motion_type = str(event.get("parsed_motion_type", "")).lower()
+                stop_reason = str(event.get("stop_reason", "")).lower()
+                if raw_filter in (event_type, parsed_motion_type, stop_reason):
+                    filtered.append(event)
+            enriched_recent = filtered
+
+        clip_query = clip_contains.strip().lower()
+        if clip_query:
+            enriched_recent = [
+                event
+                for event in enriched_recent
+                if clip_query in str(event.get("video_file", "")).lower()
+            ]
+
+        recent_limited = enriched_recent[: max(1, min(120, limit))]
+        available_types = sorted(
+            {
+                str(event.get("event_type", "unknown"))
+                for event in all_enriched
+                if str(event.get("event_type", "")).strip()
+            }
+            | {
+                str(event.get("parsed_motion_type", ""))
+                for event in all_enriched
+                if str(event.get("parsed_motion_type", "")).strip()
+            }
+        )
+        event_type_counts: Dict[str, int] = {}
+        for event in enriched_recent:
+            label = str(event.get("event_type", "unknown"))
+            event_type_counts[label] = event_type_counts.get(label, 0) + 1
 
         return {
             "status": "ok",
             "stream_ready": self.get_latest_jpeg() is not None,
             "capture_fps": self.capture_fps,
             "recording": self.writer is not None,
-            "recent_events": recent,
+            "recent_events": recent_limited,
+            "available_types": available_types,
+            "event_type_counts": event_type_counts,
             "time": datetime.now().isoformat(),
         }
+
+    def get_clip_features_for_name(self, clip_name: str) -> Dict:
+        safe_name = Path(clip_name).name
+        if safe_name != clip_name or not safe_name.endswith(".mp4"):
+            return {"error": "invalid_clip_name"}
+        clip_path = (self.storage_path / safe_name).resolve()
+        if not clip_path.exists():
+            return {"error": "clip_not_found"}
+        parsed = self._get_clip_features(clip_path)
+        payload = {
+            "clip": safe_name,
+            "video_path": str(clip_path),
+        }
+        payload.update(parsed)
+        return payload
 
 
 class StreamHandler(BaseHTTPRequestHandler):
     camera: RingCamera
     access_token: Optional[str]
+    admin_token: Optional[str]
+    remote_view_flag_file: Path
+    trust_proxy_headers: bool
 
     def log_message(self, fmt: str, *args) -> None:
         logger.info("HTTP %s - %s", self.address_string(), fmt % args)
 
+    def _send_security_headers(self) -> None:
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'")
+
+    def _client_ip(self) -> str:
+        if self.trust_proxy_headers:
+            forwarded = self.headers.get("X-Forwarded-For", "")
+            if forwarded:
+                return forwarded.split(",")[0].strip()
+        return str(self.client_address[0])
+
+    def _is_local_client(self) -> bool:
+        ip_text = self._client_ip()
+        try:
+            addr = ipaddress.ip_address(ip_text)
+            return bool(addr.is_private or addr.is_loopback)
+        except ValueError:
+            return False
+
+    def _remote_view_enabled(self) -> bool:
+        return self.remote_view_flag_file.exists()
+
+    def _can_view(self) -> bool:
+        if self._is_local_client():
+            return True
+        return self._remote_view_enabled()
+
+    def _get_query_value(self, key: str) -> str:
+        parsed = urlparse(self.path)
+        return parse_qs(parsed.query).get(key, [""])[0]
+
     def _authorized(self) -> bool:
+        # Local-only deployments can access without token.
+        if self._is_local_client():
+            return True
         if not self.access_token:
             return True
-        parsed = urlparse(self.path)
-        token = parse_qs(parsed.query).get("token", [""])[0]
-        return token == self.access_token
+        token = self._get_query_value("token")
+        if token and secrets.compare_digest(token, self.access_token):
+            return True
+        bearer = self.headers.get("Authorization", "")
+        if bearer.startswith("Bearer "):
+            candidate = bearer[7:].strip()
+            return bool(candidate and secrets.compare_digest(candidate, self.access_token))
+        return False
+
+    def _admin_authorized(self) -> bool:
+        if not self.admin_token:
+            return False
+        token = self._get_query_value("admin_token")
+        if token and secrets.compare_digest(token, self.admin_token):
+            return True
+        header_token = self.headers.get("X-Admin-Token", "").strip()
+        return bool(header_token and secrets.compare_digest(header_token, self.admin_token))
+
+    def _read_json_body(self) -> Dict:
+        content_len = int(self.headers.get("Content-Length", "0") or "0")
+        if content_len <= 0:
+            return {}
+        raw = self.rfile.read(min(content_len, 8192))
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
 
     def _send_json(self, payload: Dict, status: HTTPStatus = HTTPStatus.OK) -> None:
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, private")
+        self.send_header("Pragma", "no-cache")
+        self._send_security_headers()
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -393,6 +691,13 @@ class StreamHandler(BaseHTTPRequestHandler):
         self._send_json({"error": "forbidden"}, HTTPStatus.FORBIDDEN)
 
     def _serve_home(self) -> None:
+        if not self._can_view():
+            self._forbidden()
+            return
+        if not self._authorized():
+            self._forbidden()
+            return
+
         token_query = ""
         if self.access_token:
             token_query = f"?token={self.access_token}"
@@ -402,57 +707,132 @@ class StreamHandler(BaseHTTPRequestHandler):
 <head>
   <meta charset=\"utf-8\" />
   <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
-  <title>Home Camera</title>
+  <title>Dolly Bates Camera</title>
   <style>
-    :root {{ --bg:#0b0f14; --panel:#121822; --line:#1f2a3b; --text:#e8edf5; --muted:#96a4b8; --good:#3ccf91; --warn:#ffad3d; }}
-    body {{ margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; background: radial-gradient(circle at 20% 0%, #122037, var(--bg) 50%); color: var(--text); }}
-    .wrap {{ max-width: 1100px; margin: 18px auto; padding: 0 12px; }}
+    :root {{ --brand:#AF69EE; --bg:#12081f; --panel:#1f1133; --line:#512b76; --text:#f5ebff; --muted:#c9b3df; --accent:#d4a9ff; --accent2:#9465c8; }}
+    body {{ margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; background: radial-gradient(circle at 20% 0%, #5f2f8f, var(--bg) 52%); color: var(--text); }}
+    .wrap {{ max-width: 1100px; margin: 18px auto; padding: 0 12px 24px; }}
     .grid {{ display:grid; grid-template-columns: 2fr 1fr; gap: 12px; }}
-    .card {{ background: linear-gradient(180deg, #141d2b, var(--panel)); border:1px solid var(--line); border-radius: 14px; padding: 12px; box-shadow: 0 8px 30px rgba(0,0,0,0.26); }}
+    .card {{ background: linear-gradient(180deg, #2a1646, var(--panel)); border:1px solid var(--line); border-radius: 14px; padding: 12px; box-shadow: 0 8px 30px rgba(17,5,31,0.46); }}
     img {{ width:100%; border-radius:12px; border:1px solid var(--line); }}
+    video {{ width:100%; border-radius:12px; border:1px solid var(--line); margin-top:10px; background:#000; }}
     h1, h2 {{ margin:0 0 10px; }}
     h1 {{ font-size:1.1rem; }}
     h2 {{ font-size:1rem; color: var(--muted); }}
     table {{ width:100%; border-collapse:collapse; font-size: 0.85rem; }}
-    th, td {{ text-align:left; padding:6px 4px; border-bottom: 1px solid #1a2434; }}
+    th, td {{ text-align:left; padding:6px 4px; border-bottom: 1px solid #31164f; }}
+    button {{ background:linear-gradient(180deg, var(--brand), #9155ce); color:#1f0935; border:1px solid #c896ff; border-radius:8px; padding:4px 8px; cursor:pointer; font-weight:600; }}
+    button:hover {{ background:linear-gradient(180deg, #c58bff, #a665eb); }}
+    .controls {{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px; }}
+    input, select {{ background:#190d2b; color:var(--text); border:1px solid #6f449d; border-radius:8px; padding:4px 8px; }}
+    .stats {{ color:var(--muted); font-size:0.78rem; margin-bottom:8px; line-height:1.35; }}
     .badge {{ padding: 2px 6px; border-radius: 8px; font-size: 0.72rem; }}
-    .high_motion {{ background: rgba(60,207,145,0.2); color:#67f3b1; }}
-    .medium_motion {{ background: rgba(255,173,61,0.2); color:#ffd39b; }}
-    .low_motion {{ background: rgba(130,149,172,0.2); color:#c2cedd; }}
+    .high_motion {{ background: rgba(175,105,238,0.35); color:#f2dcff; }}
+    .medium_motion {{ background: rgba(156,93,215,0.30); color:#edd3ff; }}
+    .low_motion {{ background: rgba(120,73,170,0.30); color:#e4ccfb; }}
+    .steady_activity {{ background: rgba(206,166,244,0.25); color:#f4e6ff; }}
+    .intense_activity {{ background: rgba(175,105,238,0.42); color:#ffffff; }}
+    .subtle_activity {{ background: rgba(102,65,143,0.40); color:#e8d6ff; }}
     @media (max-width: 880px) {{ .grid {{ grid-template-columns: 1fr; }} }}
   </style>
 </head>
 <body>
   <div class=\"wrap\">
-    <h1>Live Home Camera</h1>
+    <h1>Dolly Bates Memorial Camera</h1>
     <div class=\"grid\">
       <div class=\"card\">
         <img src=\"/stream.mjpg{token_query}\" alt=\"Live stream\"/>
       </div>
       <div class=\"card\">
-        <h2>Recent Motion Events</h2>
+        <h2>Dolly's Recent Motion Events</h2>
         <div id=\"status\" style=\"color:var(--muted);font-size:0.82rem;margin-bottom:8px;\">Loading...</div>
+        <div class=\"controls\">
+          <select id=\"typeFilter\"><option value=\"all\">all types</option></select>
+          <input id=\"clipFilter\" placeholder=\"clip name contains...\" />
+        </div>
+        <div id=\"quickStats\" class=\"stats\"></div>
         <table>
           <thead>
-            <tr><th>Time</th><th>Type</th><th>Score</th><th>Clip</th></tr>
+            <tr><th>Time</th><th>Type</th><th>Parsed</th><th>Score</th><th>Clip</th><th>Playback</th></tr>
           </thead>
           <tbody id=\"events\"></tbody>
         </table>
+        <video id=\"clipPlayer\" controls preload=\"metadata\"></video>
       </div>
     </div>
   </div>
 <script>
+const tokenQuery = {json.dumps(token_query)};
+const clipPlayer = document.getElementById('clipPlayer');
+const typeFilter = document.getElementById('typeFilter');
+const clipFilter = document.getElementById('clipFilter');
+const eventsEl = document.getElementById('events');
+const quickStats = document.getElementById('quickStats');
+
+function escapeHtml(text) {{
+  return String(text || '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}}
+
+function clipUrl(fileName) {{
+  return `/clips-web/${{encodeURIComponent(fileName)}}${{tokenQuery}}`;
+}}
+function playClip(fileName) {{
+  clipPlayer.src = clipUrl(fileName);
+  clipPlayer.play().catch(() => {{}});
+}}
+
+eventsEl.addEventListener('click', (evt) => {{
+  const btn = evt.target.closest('button[data-clip]');
+  if (!btn) return;
+  playClip(btn.getAttribute('data-clip'));
+}});
+
+let knownTypes = ['all'];
+function updateTypeFilter(data) {{
+  const serverTypes = (data.available_types || []).filter(Boolean);
+  knownTypes = Array.from(new Set(['all', ...serverTypes])).sort();
+  const current = typeFilter.value || 'all';
+  typeFilter.innerHTML = knownTypes.map(t => `<option value="${{escapeHtml(t)}}">${{escapeHtml(t)}}</option>`).join('');
+  typeFilter.value = knownTypes.includes(current) ? current : 'all';
+}}
+
 async function refresh() {{
-  const r = await fetch('/api/status');
+  const selectedType = typeFilter.value || 'all';
+  const clipContains = clipFilter.value || '';
+  const params = new URLSearchParams();
+  if (tokenQuery.startsWith('?token=')) {{
+    params.set('token', tokenQuery.slice(7));
+  }}
+  if (selectedType && selectedType !== 'all') params.set('type', selectedType);
+  if (clipContains) params.set('clip_contains', clipContains);
+
+  const r = await fetch(`/api/status?${{params.toString()}}`);
+  if (!r.ok) {{
+    document.getElementById('status').textContent = `status fetch failed: ${{r.status}}`;
+    return;
+  }}
   const data = await r.json();
+  updateTypeFilter(data);
   const status = document.getElementById('status');
   status.textContent = `stream_ready=${{data.stream_ready}} capture_fps=${{(data.capture_fps||0).toFixed(1)}} recording=${{data.recording}}`;
+  const countBits = Object.entries(data.event_type_counts || {{}}).map(([k, v]) => `${{k}}:${{v}}`);
+  quickStats.textContent = countBits.length ? `visible counts: ${{countBits.join(' | ')}}` : 'visible counts: none';
   const rows = (data.recent_events || []).slice(0, 12).map(e => {{
     const cls = e.event_type || 'low_motion';
-    return `<tr><td>${{(e.timestamp||'').replace('T',' ').slice(0,19)}}</td><td><span class=\"badge ${{cls}}\">${{cls}}</span></td><td>${{(e.highlight_score||0).toFixed(3)}}</td><td>${{e.video_file||''}}</td></tr>`;
+    const parsedType = e.parsed_motion_type || 'n/a';
+    const clip = e.video_file || '';
+    const playButton = clip ? `<button type="button" data-clip="${{escapeHtml(clip)}}">Play</button>` : '';
+    return `<tr><td>${{escapeHtml((e.timestamp||'').replace('T',' ').slice(0,19))}}</td><td><span class="badge ${{escapeHtml(cls)}}">${{escapeHtml(cls)}}</span></td><td><span class="badge ${{escapeHtml(parsedType)}}">${{escapeHtml(parsedType)}}</span></td><td>${{(e.highlight_score||0).toFixed(3)}}</td><td>${{escapeHtml(clip)}}</td><td>${{playButton}}</td></tr>`;
   }}).join('');
-  document.getElementById('events').innerHTML = rows || '<tr><td colspan="4">No events yet</td></tr>';
+  eventsEl.innerHTML = rows || '<tr><td colspan="6">No events yet</td></tr>';
 }}
+typeFilter.addEventListener('change', refresh);
+clipFilter.addEventListener('input', () => setTimeout(refresh, 0));
 setInterval(refresh, 3000);
 refresh();
 </script>
@@ -462,11 +842,16 @@ refresh();
         body = html.encode("utf-8")
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self._send_security_headers()
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
     def _serve_stream(self) -> None:
+        if not self._can_view():
+            self._forbidden()
+            return
         if not self._authorized():
             self._forbidden()
             return
@@ -476,6 +861,7 @@ refresh();
         self.send_header("Pragma", "no-cache")
         self.send_header("Connection", "close")
         self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self._send_security_headers()
         self.end_headers()
 
         try:
@@ -494,6 +880,121 @@ refresh();
         except (ConnectionResetError, BrokenPipeError):
             return
 
+    def _resolve_clip_path(self, clip_name: str) -> Optional[Path]:
+        decoded = unquote(clip_name)
+        safe_name = Path(decoded).name
+        if safe_name != decoded or not safe_name.endswith(".mp4"):
+            return None
+        clip_path = (self.camera.storage_path / safe_name).resolve()
+        storage_root = self.camera.storage_path.resolve()
+        if storage_root not in clip_path.parents or not clip_path.exists():
+            return None
+        return clip_path
+
+    def _serve_video_file(self, clip_path: Path) -> None:
+        if not self._can_view() or not self._authorized():
+            self._forbidden()
+            return
+
+        file_size = clip_path.stat().st_size
+        range_header = self.headers.get("Range", "")
+        start = 0
+        end = max(0, file_size - 1)
+        status = HTTPStatus.OK
+
+        if range_header.startswith("bytes="):
+            try:
+                start_text, end_text = range_header.replace("bytes=", "", 1).split("-", 1)
+                if start_text:
+                    start = int(start_text)
+                if end_text:
+                    end = int(end_text)
+                start = max(0, start)
+                end = min(end, file_size - 1)
+                if start > end:
+                    raise ValueError("invalid range")
+                status = HTTPStatus.PARTIAL_CONTENT
+            except Exception:
+                self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                self.send_header("Content-Range", f"bytes */{file_size}")
+                self._send_security_headers()
+                self.end_headers()
+                return
+
+        chunk_len = (end - start) + 1
+        self.send_response(status)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Cache-Control", "no-store")
+        self._send_security_headers()
+        if status == HTTPStatus.PARTIAL_CONTENT:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+        self.send_header("Content-Length", str(chunk_len))
+        self.end_headers()
+
+        with open(clip_path, "rb") as f:
+            f.seek(start)
+            remaining = chunk_len
+            while remaining > 0:
+                block = f.read(min(64 * 1024, remaining))
+                if not block:
+                    break
+                self.wfile.write(block)
+                remaining -= len(block)
+
+    def _serve_clip(self, clip_name: str) -> None:
+        clip_path = self._resolve_clip_path(clip_name)
+        if clip_path is None:
+            self._send_json({"error": "clip_not_found"}, HTTPStatus.NOT_FOUND)
+            return
+        self._serve_video_file(clip_path)
+
+    def _serve_web_clip(self, clip_name: str) -> None:
+        clip_path = self._resolve_clip_path(clip_name)
+        if clip_path is None:
+            self._send_json({"error": "clip_not_found"}, HTTPStatus.NOT_FOUND)
+            return
+
+        web_target = self.camera.web_clips_dir / f"{clip_path.stem}.web.mp4"
+        needs_transcode = (not web_target.exists()) or (web_target.stat().st_mtime < clip_path.stat().st_mtime)
+
+        if needs_transcode:
+            ffmpeg_cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(clip_path),
+                "-map",
+                "0:v:0",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "24",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                str(web_target),
+            ]
+            with self.camera.web_clip_lock:
+                needs_transcode = (not web_target.exists()) or (web_target.stat().st_mtime < clip_path.stat().st_mtime)
+                if needs_transcode:
+                    try:
+                        subprocess.run(
+                            ffmpeg_cmd,
+                            check=True,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                    except Exception:
+                        # Fallback to original if transcoding is unavailable.
+                        self._serve_video_file(clip_path)
+                        return
+
+        self._serve_video_file(web_target)
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
 
@@ -504,26 +1005,129 @@ refresh();
             self._send_json(self.camera.get_status())
             return
         if parsed.path == "/api/status":
+            if not self._can_view():
+                self._forbidden()
+                return
             if not self._authorized():
                 self._forbidden()
                 return
-            self._send_json(self.camera.get_status())
+            event_type_filter = parse_qs(parsed.query).get("type", [""])[0]
+            clip_contains = parse_qs(parsed.query).get("clip_contains", [""])[0]
+            raw_limit = parse_qs(parsed.query).get("limit", ["20"])[0]
+            try:
+                limit = int(raw_limit)
+            except ValueError:
+                limit = 20
+            self._send_json(
+                self.camera.get_status(
+                    event_type_filter=event_type_filter,
+                    clip_contains=clip_contains,
+                    limit=limit,
+                )
+            )
+            return
+        if parsed.path == "/api/clip-features":
+            if not self._can_view():
+                self._forbidden()
+                return
+            if not self._authorized():
+                self._forbidden()
+                return
+            clip_name = parse_qs(parsed.query).get("clip", [""])[0]
+            if not clip_name:
+                self._send_json({"error": "missing_clip"}, HTTPStatus.BAD_REQUEST)
+                return
+            result = self.camera.get_clip_features_for_name(clip_name)
+            if result.get("error"):
+                status = HTTPStatus.BAD_REQUEST if result["error"] == "invalid_clip_name" else HTTPStatus.NOT_FOUND
+                self._send_json(result, status)
+                return
+            self._send_json(result)
+            return
+        if parsed.path == "/api/remote-view":
+            if not self._authorized():
+                self._forbidden()
+                return
+            self._send_json(
+                {
+                    "remote_view_enabled": self._remote_view_enabled(),
+                    "client_ip": self._client_ip(),
+                    "is_local_client": self._is_local_client(),
+                }
+            )
             return
         if parsed.path == "/stream.mjpg":
             self._serve_stream()
+            return
+        if parsed.path.startswith("/clips/"):
+            clip_name = parsed.path[len("/clips/") :]
+            self._serve_clip(clip_name)
+            return
+        if parsed.path.startswith("/clips-web/"):
+            clip_name = parsed.path[len("/clips-web/") :]
+            self._serve_web_clip(clip_name)
             return
 
         self.send_response(HTTPStatus.NOT_FOUND)
         self.end_headers()
 
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path != "/api/remote-view":
+            self.send_response(HTTPStatus.NOT_FOUND)
+            self.end_headers()
+            return
 
-def serve(camera: RingCamera, host: str, port: int, access_token: Optional[str]) -> None:
+        if not self._admin_authorized():
+            self._forbidden()
+            return
+
+        action = self._get_query_value("action")
+        if not action:
+            body = self._read_json_body()
+            action = str(body.get("action", "")).strip().lower()
+
+        if action == "disable":
+            self.remote_view_flag_file.unlink(missing_ok=True)
+        elif action == "enable":
+            if not self._is_local_client():
+                self._send_json(
+                    {"error": "enable_allowed_from_local_only"},
+                    HTTPStatus.FORBIDDEN,
+                )
+                return
+            self.remote_view_flag_file.parent.mkdir(parents=True, exist_ok=True)
+            self.remote_view_flag_file.touch(exist_ok=True)
+        else:
+            self._send_json({"error": "action_must_be_enable_or_disable"}, HTTPStatus.BAD_REQUEST)
+            return
+
+        self._send_json(
+            {
+                "ok": True,
+                "remote_view_enabled": self._remote_view_enabled(),
+            }
+        )
+
+
+def serve(
+    camera: RingCamera,
+    host: str,
+    port: int,
+    access_token: Optional[str],
+    admin_token: Optional[str],
+    remote_view_flag_file: Path,
+    trust_proxy_headers: bool,
+) -> None:
     handler_cls = type("BoundStreamHandler", (StreamHandler,), {})
     handler_cls.camera = camera
     handler_cls.access_token = access_token
+    handler_cls.admin_token = admin_token
+    handler_cls.remote_view_flag_file = remote_view_flag_file
+    handler_cls.trust_proxy_headers = trust_proxy_headers
 
     server = ThreadingHTTPServer((host, port), handler_cls)
-    logger.info("Live stream ready at http://%s:%s", host, port)
+    logger.info("Dolly Bates stream ready at http://%s:%s", host, port)
 
     def _shutdown(*_args: object) -> None:
         logger.info("Shutting down")
@@ -547,7 +1151,7 @@ def parse_resolution(value: str) -> Tuple[int, int]:
 
 def run_self_test() -> int:
     """Synthetic validation that motion detection creates and saves clips."""
-    with TemporaryDirectory(prefix="ring-camera-test-") as tmp:
+    with TemporaryDirectory(prefix="dolly-bates-camera-test-") as tmp:
         camera = RingCamera(
             storage_path=tmp,
             video_device=0,
@@ -599,7 +1203,7 @@ def run_self_test() -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Raspberry Pi home camera")
+    parser = argparse.ArgumentParser(description="Dolly Bates memorial camera")
     parser.add_argument("--storage-path", default="./recordings", help="Directory for motion clips")
     parser.add_argument("--video-device", type=int, default=0, help="Video device index")
     parser.add_argument("--resolution", type=parse_resolution, default=parse_resolution("1280x720"), help="WIDTHxHEIGHT")
@@ -616,7 +1220,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-storage-percent", type=float, default=90.0, help="Cleanup usage threshold")
     parser.add_argument("--host", default="0.0.0.0", help="Bind host")
     parser.add_argument("--port", type=int, default=8080, help="Bind port")
-    parser.add_argument("--access-token", default=None, help="Optional stream/API token")
+    parser.add_argument("--access-token", default=None, help="Required stream/API token")
+    parser.add_argument("--allow-insecure-no-token", action="store_true", help="Allow running without --access-token (not recommended)")
+    parser.add_argument("--admin-token", default=None, help="Admin token for remote-view enable/disable API")
+    parser.add_argument(
+        "--remote-view-default",
+        choices=("on", "off"),
+        default="on",
+        help="Initial remote-view state for non-local clients",
+    )
+    parser.add_argument(
+        "--remote-view-flag-file",
+        default=None,
+        help="Path to flag file controlling remote view state (default: <storage>/remote_view.enabled)",
+    )
+    parser.add_argument(
+        "--trust-proxy-headers",
+        action="store_true",
+        help="Trust X-Forwarded-For from reverse proxy for client IP detection",
+    )
     parser.add_argument("--self-test", action="store_true", help="Run synthetic clip-saving test and exit")
     return parser
 
@@ -627,6 +1249,12 @@ def main() -> None:
 
     if args.self_test:
         raise SystemExit(run_self_test())
+
+    if not args.access_token and not args.allow_insecure_no_token:
+        raise SystemExit(
+            "Refusing to start without --access-token. "
+            "Set a long token, or pass --allow-insecure-no-token if you explicitly accept the risk."
+        )
 
     camera = RingCamera(
         storage_path=args.storage_path,
@@ -649,7 +1277,26 @@ def main() -> None:
         max_storage_percent=args.max_storage_percent,
     )
 
-    serve(camera, host=args.host, port=args.port, access_token=args.access_token)
+    remote_view_flag_file = (
+        Path(args.remote_view_flag_file).expanduser()
+        if args.remote_view_flag_file
+        else (Path(args.storage_path) / "remote_view.enabled")
+    )
+    remote_view_flag_file.parent.mkdir(parents=True, exist_ok=True)
+    if args.remote_view_default == "on":
+        remote_view_flag_file.touch(exist_ok=True)
+    else:
+        remote_view_flag_file.unlink(missing_ok=True)
+
+    serve(
+        camera,
+        host=args.host,
+        port=args.port,
+        access_token=args.access_token,
+        admin_token=args.admin_token,
+        remote_view_flag_file=remote_view_flag_file,
+        trust_proxy_headers=args.trust_proxy_headers,
+    )
 
 
 if __name__ == "__main__":

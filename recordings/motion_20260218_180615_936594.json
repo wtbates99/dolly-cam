@@ -1,0 +1,19 @@
+{
+  "timestamp": "2026-02-18T18:06:44.913072",
+  "video_file": "motion_20260218_180615_936594.mp4",
+  "video_path": "/home/wtb/clones/dolly-cam/recordings/motion_20260218_180615_936594.mp4",
+  "event_type": "high_motion",
+  "duration_seconds": 29.01017999649048,
+  "frame_count": 311,
+  "motion_avg": 0.16254892134402446,
+  "motion_peak": 0.25718207465277776,
+  "motion_area_peak": 227426.5,
+  "highlight_score": 1.0,
+  "is_highlight": true,
+  "stop_reason": "shutdown",
+  "file_size_bytes": 19255472,
+  "noise_level": "n/a",
+  "noise_spike_ratio": 0.0,
+  "segment_audio_peak_rms": 0.0,
+  "ambient_audio_rms": 0.0
+}
