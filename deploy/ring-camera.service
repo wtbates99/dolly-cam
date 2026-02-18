@@ -1,0 +1,15 @@
+[Unit]
+Description=Raspberry Pi Ring-Style Home Camera
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/dolly-cam
+ExecStart=/usr/bin/python3 /home/pi/dolly-cam/ring_camera.py --storage-path /home/pi/dolly-cam/recordings --resolution 1280x720 --fps 15 --stream-fps 8 --delta-thresh 20 --min-motion-area 1200 --cooldown-seconds 6 --pre-motion-seconds 2 --max-clip-seconds 45 --host 0.0.0.0 --port 8080 --access-token CHANGE_ME
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

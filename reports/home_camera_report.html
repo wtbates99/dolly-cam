@@ -1,0 +1,44 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Home Camera Report</title>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; margin: 22px; }
+    .meta { margin-bottom: 16px; }
+    img { max-width: 100%; border: 1px solid #ddd; margin-bottom: 14px; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #ddd; padding: 7px; font-size: 14px; }
+    th { background: #f4f6f8; text-align: left; }
+  </style>
+</head>
+<body>
+  <h1>Home Camera Activity Report</h1>
+  <div class="meta">
+    <div><strong>Total clips:</strong> 2</div>
+    <div><strong>Total highlights:</strong> 2</div>
+    <div><strong>Total motion time:</strong> 72.3s</div>
+  </div>
+
+  <h2>Timeline</h2>
+  <img src="timeline.png" alt="timeline" />
+
+  <h2>Weekly Heatmap</h2>
+  <img src="hourly_heatmap.png" alt="heatmap" />
+
+  <h2>Event Counts</h2>
+  <img src="event_counts.png" alt="counts" />
+
+  <h2>Featured Clip</h2><div><strong>2026-02-13T21:12:11</strong> score=1.000</div><video controls preload="metadata" width="960"><source src="highlight_clips/dog_tracking_20260213_211104_seg0000.web.mp4" type="video/mp4"></video>
+
+  <h2>Top Highlights</h2>
+  <table>
+    <thead>
+      <tr><th>Timestamp</th><th>Clip</th><th>Type</th><th>Score</th><th>Seconds</th><th>Motion Peak</th><th>Video</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>2026-02-13T21:12:11</td><td>dog_tracking_20260213_211104_seg0000.mp4</td><td>audio_and_motion</td><td>1.000</td><td>59.3</td><td>0.2256</td><td><a href="highlight_clips/dog_tracking_20260213_211104_seg0000.web.mp4" target="_blank">Play</a></td></tr><tr><td>2026-02-13T21:12:25</td><td>dog_tracking_20260213_211211_seg0001.mp4</td><td>audio_and_motion</td><td>1.000</td><td>13.0</td><td>0.2085</td><td><a href="highlight_clips/dog_tracking_20260213_211211_seg0001.web.mp4" target="_blank">Play</a></td></tr>
+    </tbody>
+  </table>
+</body>
+</html>
