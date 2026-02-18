@@ -8,6 +8,19 @@ __pycache__/
 service-account.json
 config.toml
 
+# Project runtime artifacts
+recordings/
+reports/highlight_clips/
+reports/event_counts.png
+reports/hourly_heatmap.png
+reports/timeline.png
+reports/home_camera_report.html
+*.wav
+*.jsonl
+*.web.mp4
+remote_view.enabled
+.DS_Store
+
 # C extensions
 *.so
 
